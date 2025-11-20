@@ -6,7 +6,6 @@ st.set_page_config(page_title="Trade PnL Dashboard", layout="wide")
 st.title("📈 Trade PnL Dashboard")
 
 def load_data(uploaded_file):
-    # Try to read Excel/CSV with correct engine
     try:
         if uploaded_file.name.endswith('.xlsx'):
             df = pd.read_excel(uploaded_file, engine='openpyxl')
@@ -18,7 +17,6 @@ def load_data(uploaded_file):
     except Exception as e:
         st.error(f"Error reading file: {e}")
         return None
-    # Normalize all column names: lower/underscores/strip spaces
     df.columns = [c.strip().replace(" ", "_").replace("-", "_").lower() for c in df.columns]
     return df
 
@@ -31,9 +29,8 @@ if uploaded_file:
     st.write("**Columns detected:**", df.columns.tolist())
     st.dataframe(df.head())
 
-    # Check for date column (common patterns)
+    # Date column selection
     date_candidates = [col for col in df.columns if "date" in col]
-    # User chooses if there are multiple
     if not date_candidates:
         st.error("No column containing 'date' found. Please verify your file.")
         st.stop()
@@ -44,8 +41,15 @@ if uploaded_file:
         st.error(f"Could not convert date column: {e}")
         st.stop()
 
-    # Find key fields
-    col_map = {}
+    # Multiple accounts support
+    account_candidates = [col for col in df.columns if 'account' in col]
+    account_col = None
+    if account_candidates:
+        account_col = st.selectbox("Select the account column (optional):", ["None"] + account_candidates)
+        if account_col == "None":
+            account_col = None
+
+    # Key fields suggestions & user selectors
     suggestions = {
         'symbol': ['symbol', 'ticker'],
         'action': ['action', 'side', 'trade_type'],
@@ -53,14 +57,13 @@ if uploaded_file:
         'price': ['price', 'entry_price'],
         'net_amount': ['net_amount', 'value', 'amount', 'pnl']
     }
+    col_map = {}
     for k, options in suggestions.items():
         for o in options:
             found = [c for c in df.columns if o in c]
             if found:
                 col_map[k] = found[0]
                 break
-
-    # User override for each mandatory field
     for field in ['symbol', 'action', 'quantity', 'price', 'net_amount']:
         if field not in col_map:
             col_map[field] = st.selectbox(
@@ -68,7 +71,10 @@ if uploaded_file:
                 df.columns.tolist()
             )
 
-    # Deduplication logic - robust trade ID computation
+    # Robust string conversion for 'action' column
+    df[col_map['action']] = df[col_map['action']].astype(str).str.lower().str.strip()
+
+    # Deduplicate
     df['trade_id'] = df[date_col].astype(str) + '_' + \
                      df[col_map['symbol']].astype(str) + '_' + \
                      df[col_map['action']].astype(str) + '_' + \
@@ -76,14 +82,29 @@ if uploaded_file:
                      df[col_map['price']].astype(str)
     df = df.drop_duplicates(subset=['trade_id'])
 
-    # Basic trade matching (Long only: match each Buy with next Sell of same qty)
-    df = df.sort_values(date_col)
+    # Support multiple accounts
+    accounts_to_show = ['All']
+    if account_col:
+        accounts_to_show += sorted(df[account_col].dropna().unique().tolist())
+    selected_account = st.selectbox("Choose account to display:", accounts_to_show)
+
+    if selected_account != 'All' and account_col:
+        work_df = df[df[account_col] == selected_account]
+    else:
+        work_df = df
+
+    if work_df.empty:
+        st.warning("No trades to display for this account/selection.")
+        st.stop()
+
+    # Trade matching (Long only; Buy→Sell matching per symbol per account)
+    work_df = work_df.sort_values(date_col)
     trades = []
-    g = df.groupby(col_map['symbol'])
+    g = work_df.groupby(col_map['symbol'])
     for sym, group in g:
         symbol_trades = group.copy()
-        buys = symbol_trades[symbol_trades[col_map['action']].str.lower() == 'buy']
-        sells = symbol_trades[symbol_trades[col_map['action']].str.lower() == 'sell']
+        buys = symbol_trades[symbol_trades[col_map['action']] == 'buy']
+        sells = symbol_trades[symbol_trades[col_map['action']] == 'sell']
         used_sells = set()
         for i, buy in buys.iterrows():
             candidates = sells[(abs(sells[col_map['quantity']]) == abs(buy[col_map['quantity']])) & (~sells.index.isin(used_sells))]
@@ -99,6 +120,8 @@ if uploaded_file:
                     'Quantity': buy[col_map['quantity']],
                     'PnL': pnl,
                 }
+                if account_col:
+                    trade['Account'] = buy[account_col]
                 trades.append(trade)
                 used_sells.add(sell.name)
 
@@ -111,10 +134,11 @@ if uploaded_file:
     st.subheader("Matched Trades")
     st.dataframe(trades_df)
 
-    # PnL by day, week, month
+    # Time analytics
     trades_df['Sell Date'] = pd.to_datetime(trades_df['Sell Date'])
     trades_df['YearMonth'] = trades_df['Sell Date'].dt.to_period('M').astype(str)
     trades_df['YearWeek'] = trades_df['Sell Date'].dt.strftime("%Y-W%U")
+
     st.subheader("Summary")
     st.write("**Daily PnL**")
     st.bar_chart(trades_df.groupby('Sell Date')['PnL'].sum())
@@ -128,7 +152,9 @@ if uploaded_file:
     st.write("**PnL by Ticker**")
     st.bar_chart(trades_df.groupby('Symbol')['PnL'].sum())
 
-    st.download_button("Download Detailed Trades", trades_df.to_csv(index=False), file_name="detailed_trades.csv", mime='text/csv')
+    st.download_button(
+        "Download Detailed Trades",
+        trades_df.to_csv(index=False), file_name="detailed_trades.csv", mime='text/csv')
 
 else:
     st.info("Upload your trade data file (Excel/CSV) to begin.")
