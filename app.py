@@ -23,12 +23,9 @@ def load_data(uploaded_file):
     df.columns = [c.strip().replace(" ", "_").replace("-", "_").lower() for c in df.columns]
     return df
 
-def transpose(matrix):
-    return list(map(list, zip(*matrix)))
-
 def calendar_table(trades_df, target_month, target_year):
-    monthrange = calendar.monthrange(target_year, target_month)
-    first_wday, num_days = monthrange
+    # Build the grid for the calendar
+    first_wday, num_days = calendar.monthrange(target_year, target_month)
     days_in_month = [datetime(target_year, target_month, day) for day in range(1, num_days + 1)]
     weeks = []
     week = [None] * first_wday
@@ -38,7 +35,12 @@ def calendar_table(trades_df, target_month, target_year):
             weeks.append(week)
             week = []
     if week:
-        weeks.append(week + [None] * (7 - len(week)))
+        week += [None] * (7 - len(week))
+        weeks.append(week)
+    # Ensure all weeks have exactly 7 elements for rectangular shape
+    for w in weeks:
+        while len(w) < 7:
+            w.append(None)
 
     pnl_by_day = trades_df.groupby(trades_df['sell_date'].dt.date)['PnL'].sum()
     count_by_day = trades_df.groupby(trades_df['sell_date'].dt.date).size()
@@ -72,21 +74,22 @@ def calendar_table(trades_df, target_month, target_year):
         cell_colors.append(row_colors)
         cell_hovers.append(row_hovers)
 
-    # Transpose for Plotly Table
-    table_vals_t = transpose(table_vals)
-    cell_colors_t = transpose(cell_colors)
-    cell_hovers_t = transpose(cell_hovers)
+    # Transpose lists to columns for Plotly Table input
+    table_vals_t = list(map(list, zip(*table_vals)))
+    cell_colors_t = list(map(list, zip(*cell_colors)))
+    cell_hovers_t = list(map(list, zip(*cell_hovers)))
 
     fig = go.Figure(data=[go.Table(
         header=dict(values=["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"],
                     fill_color='lightgray', align='center'),
-        cells=dict(values=table_vals_t,
-                   fill_color=cell_colors_t,
-                   align='center',
-                   font=dict(color='black', size=12),
-                   height=50,
-                   hovertext=cell_hovers_t,
-                   hoverinfo='text')
+        cells=dict(
+            values=table_vals_t,
+            fill_color=cell_colors_t,
+            align='center',
+            font=dict(color='black', size=12),
+            height=50,
+            hovertext=cell_hovers_t,
+            hoverinfo='text')
     )])
     fig.update_layout(margin=dict(l=15, r=15, b=15, t=30), height=80*len(table_vals)+80)
     return fig
@@ -94,38 +97,43 @@ def calendar_table(trades_df, target_month, target_year):
 uploaded_file = st.file_uploader("Upload your trades file (.xlsx or .csv)", type=["xlsx", "csv"])
 if uploaded_file:
     df = load_data(uploaded_file)
-    if df is None:
+    if df is None or df.empty:
+        st.warning("No data found in your uploaded file. Please check the file and try again.")
         st.stop()
     st.write("**Columns detected:**", df.columns.tolist())
     st.dataframe(df.head())
 
-    # Filter trades only (if available)
-    if 'activity_type' in df.columns:
-        trades_df = df[df['activity_type'].str.lower() == 'trades'].copy()
-    else:
-        trades_df = df.copy()
+    # Only keep real trades if available
+    trades_df = df.copy()
+    if 'activity_type' in trades_df.columns:
+        trades_df = trades_df[trades_df['activity_type'].str.lower() == 'trades'].copy()
 
-    # Make all lower case
+    if trades_df.empty:
+        st.warning("No 'Trades' records found in file. Please check 'Activity Type' values.")
+        st.stop()
+
+    # Column selectors and filters
     trades_df['action'] = trades_df.get('action', '').astype(str).str.lower().str.strip()
     trades_df = trades_df[trades_df['action'].isin(['buy', 'sell'])]
 
-    # Account selector
     acct_col = 'account_#' if 'account_#' in trades_df.columns else st.selectbox("Select your account column:", trades_df.columns.tolist())
     avail_accounts = sorted(trades_df[acct_col].dropna().unique().tolist())
     selected_account = st.selectbox("Select account:", ['All'] + avail_accounts)
     if selected_account != 'All':
         trades_df = trades_df[trades_df[acct_col] == selected_account]
+    if trades_df.empty:
+        st.warning("No trades for selected account.")
+        st.stop()
 
-    # Date column selector
     date_col = 'transaction_date' if 'transaction_date' in trades_df.columns else st.selectbox("Select trade date column:", trades_df.columns.tolist())
-    trades_df[date_col] = pd.to_datetime(trades_df[date_col])
+    trades_df[date_col] = pd.to_datetime(trades_df[date_col], errors='coerce')
 
     # Deduplication
     trades_df['trade_id'] = trades_df[date_col].astype(str) + '_' + trades_df['symbol'].astype(str) + '_' + \
                             trades_df['action'].astype(str) + '_' + trades_df['quantity'].astype(str) + '_' + trades_df['price'].astype(str)
     trades_df = trades_df.drop_duplicates('trade_id')
 
-    # Buy/Sell matching per symbol/account
+    # Match buy/sell: By symbol/account
     group_keys = ['symbol']
     if acct_col: group_keys.append(acct_col)
     trades_df = trades_df.sort_values(date_col)
@@ -135,17 +143,16 @@ if uploaded_file:
         buys = group[group['action'] == 'buy']
         sells = group[group['action'] == 'sell']
         used_sells = set()
-        for i, buy in buys.iterrows():
+        for _, buy in buys.iterrows():
             candidates = sells[(abs(sells['quantity']) == abs(buy['quantity'])) & (~sells.index.isin(used_sells))]
             if not candidates.empty:
                 sell = candidates.iloc[0]
                 pnl = float(sell['net_amount']) + float(buy['net_amount'])
-                entry_date, exit_date = buy[date_col], sell[date_col]
                 result = {
                     'Account': buy[acct_col],
                     'Symbol': buy['symbol'],
-                    'Buy Date': entry_date,
-                    'Sell Date': exit_date,
+                    'Buy Date': buy[date_col],
+                    'Sell Date': sell[date_col],
                     'Entry Price': buy['price'],
                     'Exit Price': sell['price'],
                     'Quantity': buy['quantity'],
@@ -154,30 +161,28 @@ if uploaded_file:
                 trades_summary.append(result)
                 used_sells.add(sell.name)
 
-    if not trades_summary:
-        st.warning("No matched Buy/Sell trade pairs found. Please check your file for trade records.")
+    trades_final = pd.DataFrame(trades_summary)
+    if trades_final.empty:
+        st.warning("No matched Buy/Sell trade pairs found. Please check your file for valid paired trades.")
         st.dataframe(trades_df)
         st.stop()
-    trades_final = pd.DataFrame(trades_summary)
+
     st.subheader("Matched Trades")
     st.dataframe(trades_final)
 
     trades_final['sell_date'] = pd.to_datetime(trades_final['Sell Date'])
     years = sorted(list(set([d.year for d in trades_final['sell_date']])))
     default_year = datetime.today().year if not years else years[-1]
-    default_month = datetime.today().month if not years else trades_final['sell_date'].dt.month.mode()[0]
-    # Robust index logic
-    if default_year in years:
-        year_index = years.index(default_year)
-    else:
-        year_index = 0
+    year_index = years.index(default_year) if default_year in years else 0
     months_list = list(range(1, 13))
-    if default_month in months_list:
-        month_index = months_list.index(default_month)
+    # Use mode for default month if available
+    if not trades_final.empty and trades_final['sell_date'].dt.month.mode().size > 0:
+        default_month = trades_final['sell_date'].dt.month.mode()[0]
     else:
-        month_index = 0
+        default_month = datetime.today().month
+    month_index = months_list.index(default_month) if default_month in months_list else 0
 
-    sel_year = st.selectbox("Year", years, index=year_index)
+    sel_year = st.selectbox("Year", years if years else [default_year], index=year_index)
     sel_month = st.selectbox("Month", months_list, format_func=lambda m: calendar.month_name[m], index=month_index)
 
     # Ticker filter
@@ -189,10 +194,10 @@ if uploaded_file:
         tf_calendar = trades_final
 
     st.subheader(f"PnL Calendar ({ticker_selected if ticker_selected!='All' else 'All Tickers'}): {calendar.month_name[sel_month]} {sel_year}")
-    calendar_fig = calendar_table(tf_calendar, sel_month, sel_year)
+    calendar_fig = calendar_table(tf_calendar[tf_calendar['sell_date'].dt.year == sel_year][tf_calendar['sell_date'].dt.month == sel_month], sel_month, sel_year)
     st.plotly_chart(calendar_fig, use_container_width=True)
 
-    # Stats and summary
+    # Stats and charts
     st.subheader("Performance Summary")
     total_trades = len(trades_final)
     wins = (trades_final['PnL'] > 0).sum()
