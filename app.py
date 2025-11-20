@@ -1,85 +1,134 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime
 
 st.set_page_config(page_title="Trade PnL Dashboard", layout="wide")
-
 st.title("📈 Trade PnL Dashboard")
 
-# Helper: parse and normalize uploaded file
-@st.cache_data(show_spinner=False)
 def load_data(uploaded_file):
-    df = pd.read_excel(uploaded_file) if uploaded_file.name.endswith('.xlsx') else pd.read_csv(uploaded_file)
-    df.columns = [c.strip().replace(" ", "_") for c in df.columns]
-    # Minimal normalization; expand as needed to match your broker export
-    df['Transaction_Date'] = pd.to_datetime(df['Transaction_Date'])
+    # Try to read Excel/CSV with correct engine
+    try:
+        if uploaded_file.name.endswith('.xlsx'):
+            df = pd.read_excel(uploaded_file, engine='openpyxl')
+        elif uploaded_file.name.endswith('.csv'):
+            df = pd.read_csv(uploaded_file)
+        else:
+            st.error("Unsupported file type. Please upload .xlsx or .csv")
+            return None
+    except Exception as e:
+        st.error(f"Error reading file: {e}")
+        return None
+    # Normalize all column names: lower/underscores/strip spaces
+    df.columns = [c.strip().replace(" ", "_").replace("-", "_").lower() for c in df.columns]
     return df
 
-# File upload and deduplication logic
-uploaded_file = st.file_uploader("Upload your trade file (.xlsx or .csv)", type=["xlsx", "csv"])
+uploaded_file = st.file_uploader("Upload your trades file (.xlsx or .csv)", type=["xlsx", "csv"])
 
 if uploaded_file:
     df = load_data(uploaded_file)
-    # Unique identifier: Transaction_Date + Symbol + Action + Quantity + Price
-    df['trade_id'] = df.apply(
-        lambda r: f"{r['Transaction_Date']}_{r['Symbol']}_{r['Action']}_{r['Quantity']}_{r['Price']}", axis=1)
-    # Simulate loading 'existing trades' with session state (could be a DB in production)
-    if 'all_trades' not in st.session_state:
-        st.session_state['all_trades'] = pd.DataFrame(columns=df.columns)
-    old_trades = st.session_state['all_trades']
+    if df is None:
+        st.stop()
+    st.write("**Columns detected:**", df.columns.tolist())
+    st.dataframe(df.head())
 
-    # Deduplicate: add only new trades
-    new_trades = df[~df['trade_id'].isin(old_trades['trade_id'])]
-    st.session_state['all_trades'] = pd.concat([old_trades, new_trades], ignore_index=True).drop_duplicates('trade_id')
+    # Check for date column (common patterns)
+    date_candidates = [col for col in df.columns if "date" in col]
+    # User chooses if there are multiple
+    if not date_candidates:
+        st.error("No column containing 'date' found. Please verify your file.")
+        st.stop()
+    date_col = st.selectbox("Select the date column:", date_candidates)
+    try:
+        df[date_col] = pd.to_datetime(df[date_col])
+    except Exception as e:
+        st.error(f"Could not convert date column: {e}")
+        st.stop()
 
-    st.success(f"{len(new_trades)} new trades added. Total tracked: {len(st.session_state['all_trades'])}")
+    # Find key fields
+    col_map = {}
+    suggestions = {
+        'symbol': ['symbol', 'ticker'],
+        'action': ['action', 'side', 'trade_type'],
+        'quantity': ['quantity', 'qty', 'shares'],
+        'price': ['price', 'entry_price'],
+        'net_amount': ['net_amount', 'value', 'amount', 'pnl']
+    }
+    for k, options in suggestions.items():
+        for o in options:
+            found = [c for c in df.columns if o in c]
+            if found:
+                col_map[k] = found[0]
+                break
 
-    display_df = st.session_state['all_trades'].copy()
+    # User override for each mandatory field
+    for field in ['symbol', 'action', 'quantity', 'price', 'net_amount']:
+        if field not in col_map:
+            col_map[field] = st.selectbox(
+                f"Select column for {field.replace('_', ' ').title()}:",
+                df.columns.tolist()
+            )
 
-    # Match buy/sell for PnL computation (expand as needed)
+    # Deduplication logic - robust trade ID computation
+    df['trade_id'] = df[date_col].astype(str) + '_' + \
+                     df[col_map['symbol']].astype(str) + '_' + \
+                     df[col_map['action']].astype(str) + '_' + \
+                     df[col_map['quantity']].astype(str) + '_' + \
+                     df[col_map['price']].astype(str)
+    df = df.drop_duplicates(subset=['trade_id'])
+
+    # Basic trade matching (Long only: match each Buy with next Sell of same qty)
+    df = df.sort_values(date_col)
     trades = []
-    display_df = display_df.sort_values('Transaction_Date')
-    by_symbol = display_df.groupby('Symbol')
-
-    for sym, group in by_symbol:
-        buys = group[group['Action'].str.lower() == 'buy']
-        sells = group[group['Action'].str.lower() == 'sell']
+    g = df.groupby(col_map['symbol'])
+    for sym, group in g:
+        symbol_trades = group.copy()
+        buys = symbol_trades[symbol_trades[col_map['action']].str.lower() == 'buy']
+        sells = symbol_trades[symbol_trades[col_map['action']].str.lower() == 'sell']
+        used_sells = set()
         for i, buy in buys.iterrows():
-            match = sells[sells['Quantity'].abs() == buy['Quantity'].abs()]
-            if not match.empty:
-                sell = match.iloc[0]
-                pnl = sell['Net_Amount'] + buy['Net_Amount']
-                trades.append({
+            candidates = sells[(abs(sells[col_map['quantity']]) == abs(buy[col_map['quantity']])) & (~sells.index.isin(used_sells))]
+            if not candidates.empty:
+                sell = candidates.iloc[0]
+                pnl = float(sell[col_map['net_amount']]) + float(buy[col_map['net_amount']])
+                trade = {
                     'Symbol': sym,
-                    'BuyDate': buy['Transaction_Date'],
-                    'SellDate': sell['Transaction_Date'],
-                    'Entry': buy['Price'],
-                    'Exit': sell['Price'],
-                    'Quantity': buy['Quantity'],
-                    'PnL': pnl
-                })
-                sells = sells.drop(match.index[0])
-    pnl_df = pd.DataFrame(trades)
+                    'Buy Date': buy[date_col],
+                    'Sell Date': sell[date_col],
+                    'Entry Price': buy[col_map['price']],
+                    'Exit Price': sell[col_map['price']],
+                    'Quantity': buy[col_map['quantity']],
+                    'PnL': pnl,
+                }
+                trades.append(trade)
+                used_sells.add(sell.name)
 
-    st.subheader("Trade Summary Table")
-    st.dataframe(pnl_df, use_container_width=True)
+    if not trades:
+        st.warning("No matched trades found for PnL calculation. Check your data.")
+        st.stop()
 
-    # Dashboard views
-    if not pnl_df.empty:
-        pnl_df['SellDate'] = pd.to_datetime(pnl_df['SellDate'])
-        pnl_df['YearMonth'] = pnl_df['SellDate'].dt.to_period('M')
-        pnl_df['YearWeek'] = pnl_df['SellDate'].dt.isocalendar().week
+    trades_df = pd.DataFrame(trades)
 
-        with st.expander("Daily/Weekly/Monthly PnL"):
-            st.line_chart(data=pnl_df.groupby('SellDate')['PnL'].sum())
-            st.bar_chart(data=pnl_df.groupby('YearWeek')['PnL'].sum())
-            st.bar_chart(data=pnl_df.groupby('YearMonth')['PnL'].sum())
+    st.subheader("Matched Trades")
+    st.dataframe(trades_df)
 
-        st.subheader("Ticker PnL")
-        st.bar_chart(pnl_df.groupby('Symbol')['PnL'].sum())
+    # PnL by day, week, month
+    trades_df['Sell Date'] = pd.to_datetime(trades_df['Sell Date'])
+    trades_df['YearMonth'] = trades_df['Sell Date'].dt.to_period('M').astype(str)
+    trades_df['YearWeek'] = trades_df['Sell Date'].dt.strftime("%Y-W%U")
+    st.subheader("Summary")
+    st.write("**Daily PnL**")
+    st.bar_chart(trades_df.groupby('Sell Date')['PnL'].sum())
 
-        st.download_button("Download Processed Data", pnl_df.to_csv(index=False), file_name="processed_trades.csv",
-                           mime='text/csv')
+    st.write("**Weekly PnL**")
+    st.bar_chart(trades_df.groupby('YearWeek')['PnL'].sum())
+
+    st.write("**Monthly PnL**")
+    st.bar_chart(trades_df.groupby('YearMonth')['PnL'].sum())
+
+    st.write("**PnL by Ticker**")
+    st.bar_chart(trades_df.groupby('Symbol')['PnL'].sum())
+
+    st.download_button("Download Detailed Trades", trades_df.to_csv(index=False), file_name="detailed_trades.csv", mime='text/csv')
+
 else:
-    st.info("Upload your Excel/CSV trade data to get started.")
+    st.info("Upload your trade data file (Excel/CSV) to begin.")
