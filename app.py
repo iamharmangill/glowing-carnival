@@ -1,17 +1,26 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import calplot
 
-st.set_page_config(page_title="Trade PnL Dashboard", layout="wide")
-st.title("📈 Trade PnL Dashboard")
+st.set_page_config(page_title="Trade PnL Calendar Dashboard", layout="wide")
+st.title("📈 Trade PnL Calendar Dashboard")
 
 def load_data(uploaded_file):
-    if uploaded_file.name.endswith('.xlsx'):
-        df = pd.read_excel(uploaded_file, engine='openpyxl')
-    elif uploaded_file.name.endswith('.csv'):
-        df = pd.read_csv(uploaded_file)
-    else:
-        st.error("Unsupported file type. Please upload .xlsx or .csv")
+    # Read Excel or CSV file
+    try:
+        if uploaded_file.name.endswith('.xlsx'):
+            df = pd.read_excel(uploaded_file, engine='openpyxl')
+        elif uploaded_file.name.endswith('.csv'):
+            df = pd.read_csv(uploaded_file)
+        else:
+            st.error("Unsupported file type. Please upload .xlsx or .csv")
+            return None
+    except Exception as e:
+        st.error(f"Error reading file: {e}")
         return None
+    # Normalize all column names for reliable access
     df.columns = [c.strip().replace(" ", "_").replace("-", "_").lower() for c in df.columns]
     return df
 
@@ -24,40 +33,39 @@ if uploaded_file:
     st.write("**Columns detected:**", df.columns.tolist())
     st.dataframe(df.head())
 
-    # Only keep "Trades"
+    # Filter only real trades: 'activity_type' == 'trades'
     if 'activity_type' not in df.columns:
         st.error("Missing 'Activity Type' column; cannot filter trades.")
         st.stop()
     trades_df = df[df['activity_type'].str.lower() == 'trades'].copy()
 
-    # Ensure buy/sell are lowercase strings
-    trades_df['action'] = trades_df['action'].astype(str).str.lower().str.strip()
-
-    # Select account column
+    # Account selector
     acct_col = 'account_#' if 'account_#' in trades_df.columns else st.selectbox("Select your account column:", trades_df.columns.tolist())
-    # Display account picker
     avail_accounts = sorted(trades_df[acct_col].dropna().unique().tolist())
     selected_account = st.selectbox("Show trades for account:", ['All'] + avail_accounts)
     if selected_account != 'All':
         trades_df = trades_df[trades_df[acct_col] == selected_account]
 
-    # Date column
+    # Parse date column
     date_col = 'transaction_date'
-    # Parse date
     trades_df[date_col] = pd.to_datetime(trades_df[date_col])
+
+    # Actions: Make sure they're string, lowercase, and just buy/sell
+    trades_df['action'] = trades_df['action'].astype(str).str.lower().str.strip()
+    trades_df = trades_df[trades_df['action'].isin(['buy', 'sell'])]
 
     # Deduplicate by trade id
     trades_df['trade_id'] = trades_df[date_col].astype(str) + '_' + trades_df['symbol'].astype(str) + '_' + trades_df['action'].astype(str) + '_' + trades_df['quantity'].astype(str) + '_' + trades_df['price'].astype(str)
     trades_df = trades_df.drop_duplicates('trade_id')
 
-    # Trade matching (by symbol, account)
-    trades_summary = []
+    # Match buy/sell by symbol/account
     group_keys = ['symbol']
     if acct_col:
         group_keys.append(acct_col)
     trades_df = trades_df.sort_values(date_col)
     grouped = trades_df.groupby(group_keys)
 
+    trades_summary = []
     for name, group in grouped:
         buys = group[group['action'] == 'buy']
         sells = group[group['action'] == 'sell']
@@ -93,20 +101,23 @@ if uploaded_file:
     st.subheader("Matched Trades")
     st.dataframe(trades_final)
 
-    # Analytics
+    # Calendar heatmap for daily PnL
     trades_final['Sell Date'] = pd.to_datetime(trades_final['Sell Date'])
-    trades_final['YearMonth'] = trades_final['Sell Date'].dt.to_period('M').astype(str)
+    calendar_pnl = trades_final.groupby(trades_final['Sell Date'].dt.date)['PnL'].sum()
+    calendar_pnl.index = pd.to_datetime(calendar_pnl.index)
+
+    st.subheader("Calendar Heatmap: Daily PnL")
+    fig, ax = calplot.calplot(calendar_pnl, cmap='RdYlGn', colorbar=True, suptitle='Daily PnL Calendar')
+    st.pyplot(fig)
+
+    # Weekly bar chart
     trades_final['YearWeek'] = trades_final['Sell Date'].dt.strftime("%Y-W%U")
-
-    st.subheader("Summary Analytics")
-
-    st.write("**Daily PnL**")
-    st.bar_chart(trades_final.groupby('Sell Date')['PnL'].sum())
-
-    st.write("**Weekly PnL**")
+    st.subheader("Weekly PnL (Bar Chart)")
     st.bar_chart(trades_final.groupby('YearWeek')['PnL'].sum())
 
-    st.write("**Monthly PnL**")
+    # Monthly bar chart
+    trades_final['YearMonth'] = trades_final['Sell Date'].dt.to_period('M').astype(str)
+    st.subheader("Monthly PnL (Bar Chart)")
     st.bar_chart(trades_final.groupby('YearMonth')['PnL'].sum())
 
     st.write("**PnL by Ticker**")
