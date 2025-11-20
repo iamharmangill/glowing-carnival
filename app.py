@@ -31,13 +31,14 @@ def calendar_table(trades_df, target_month, target_year):
     first_wday, num_days = monthrange
     days_in_month = [datetime(target_year, target_month, day) for day in range(1, num_days + 1)]
     weeks = []
-    week = [None]*first_wday
+    week = [None] * first_wday
     for day_dt in days_in_month:
         week.append(day_dt)
         if len(week) == 7:
             weeks.append(week)
             week = []
-    if week: weeks.append(week + [None]*(7-len(week)))
+    if week:
+        weeks.append(week + [None] * (7 - len(week)))
 
     pnl_by_day = trades_df.groupby(trades_df['sell_date'].dt.date)['PnL'].sum()
     count_by_day = trades_df.groupby(trades_df['sell_date'].dt.date).size()
@@ -161,15 +162,23 @@ if uploaded_file:
     st.subheader("Matched Trades")
     st.dataframe(trades_final)
 
-    # Calendar selectors
     trades_final['sell_date'] = pd.to_datetime(trades_final['Sell Date'])
     years = sorted(list(set([d.year for d in trades_final['sell_date']])))
     default_year = datetime.today().year if not years else years[-1]
     default_month = datetime.today().month if not years else trades_final['sell_date'].dt.month.mode()[0]
-    year_index = years.index(default_year) if default_year in years else 0
+    # Robust index logic
+    if default_year in years:
+        year_index = years.index(default_year)
+    else:
+        year_index = 0
+    months_list = list(range(1, 13))
+    if default_month in months_list:
+        month_index = months_list.index(default_month)
+    else:
+        month_index = 0
 
     sel_year = st.selectbox("Year", years, index=year_index)
-    sel_month = st.selectbox("Month", list(range(1, 13)), format_func=lambda m: calendar.month_name[m], index=default_month-1)
+    sel_month = st.selectbox("Month", months_list, format_func=lambda m: calendar.month_name[m], index=month_index)
 
     # Ticker filter
     all_tickers = sorted(trades_final['Symbol'].unique())
