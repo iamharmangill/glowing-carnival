@@ -103,7 +103,7 @@ if uploaded_file:
     st.write("**Columns detected:**", df.columns.tolist())
     st.dataframe(df.head())
 
-    # Only keep real trades if available
+    # Only keep trades activity if available
     trades_df = df.copy()
     if 'activity_type' in trades_df.columns:
         trades_df = trades_df[trades_df['activity_type'].str.lower() == 'trades'].copy()
@@ -112,7 +112,6 @@ if uploaded_file:
         st.warning("No 'Trades' records found in file. Please check 'Activity Type' values.")
         st.stop()
 
-    # Column selectors and filters
     trades_df['action'] = trades_df.get('action', '').astype(str).str.lower().str.strip()
     trades_df = trades_df[trades_df['action'].isin(['buy', 'sell'])]
 
@@ -128,12 +127,10 @@ if uploaded_file:
     date_col = 'transaction_date' if 'transaction_date' in trades_df.columns else st.selectbox("Select trade date column:", trades_df.columns.tolist())
     trades_df[date_col] = pd.to_datetime(trades_df[date_col], errors='coerce')
 
-    # Deduplication
     trades_df['trade_id'] = trades_df[date_col].astype(str) + '_' + trades_df['symbol'].astype(str) + '_' + \
                             trades_df['action'].astype(str) + '_' + trades_df['quantity'].astype(str) + '_' + trades_df['price'].astype(str)
     trades_df = trades_df.drop_duplicates('trade_id')
 
-    # Match buy/sell: By symbol/account
     group_keys = ['symbol']
     if acct_col: group_keys.append(acct_col)
     trades_df = trades_df.sort_values(date_col)
@@ -175,7 +172,6 @@ if uploaded_file:
     default_year = datetime.today().year if not years else years[-1]
     year_index = years.index(default_year) if default_year in years else 0
     months_list = list(range(1, 13))
-    # Use mode for default month if available
     if not trades_final.empty and trades_final['sell_date'].dt.month.mode().size > 0:
         default_month = trades_final['sell_date'].dt.month.mode()[0]
     else:
@@ -185,7 +181,6 @@ if uploaded_file:
     sel_year = st.selectbox("Year", years if years else [default_year], index=year_index)
     sel_month = st.selectbox("Month", months_list, format_func=lambda m: calendar.month_name[m], index=month_index)
 
-    # Ticker filter
     all_tickers = sorted(trades_final['Symbol'].unique())
     ticker_selected = st.selectbox("Ticker filter:", ['All'] + all_tickers)
     if ticker_selected != 'All':
@@ -193,11 +188,14 @@ if uploaded_file:
     else:
         tf_calendar = trades_final
 
+    # Safe boolean mask for the selected month/year
+    mask = (tf_calendar['sell_date'].dt.year == sel_year) & (tf_calendar['sell_date'].dt.month == sel_month)
+    df_calendar = tf_calendar[mask].copy()
+
     st.subheader(f"PnL Calendar ({ticker_selected if ticker_selected!='All' else 'All Tickers'}): {calendar.month_name[sel_month]} {sel_year}")
-    calendar_fig = calendar_table(tf_calendar[tf_calendar['sell_date'].dt.year == sel_year][tf_calendar['sell_date'].dt.month == sel_month], sel_month, sel_year)
+    calendar_fig = calendar_table(df_calendar, sel_month, sel_year)
     st.plotly_chart(calendar_fig, use_container_width=True)
 
-    # Stats and charts
     st.subheader("Performance Summary")
     total_trades = len(trades_final)
     wins = (trades_final['PnL'] > 0).sum()
